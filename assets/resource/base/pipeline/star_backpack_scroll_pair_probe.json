@@ -1,0 +1,27 @@
+{
+  "开发调试-星石背包单次滑动探针": {
+    "action": {
+      "type": "Custom",
+      "param": {
+        "custom_action": "StarBackpackCaptureProbe",
+        "custom_action_param": {
+          "mode": "pair_probe",
+          "debug_dir": "debug/star-backpack-probe",
+          "compare_roi": [40, 280, 640, 760],
+          "swipe": {
+            "start": [360, 930],
+            "end": [360, 505],
+            "duration_ms": 700
+          },
+          "settle_ms": 1800,
+          "compare": {
+            "min_overlap_ratio": 0.2,
+            "max_overlap_ratio": 0.9
+          }
+        }
+      }
+    },
+    "timeout": 15000,
+    "on_error": ["stop"]
+  }
+}

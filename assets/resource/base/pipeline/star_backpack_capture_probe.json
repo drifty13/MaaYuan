@@ -1,0 +1,16 @@
+{
+  "开发调试-星石背包截图探针": {
+    "action": {
+      "type": "Custom",
+      "param": {
+        "custom_action": "StarBackpackCaptureProbe",
+        "custom_action_param": {
+          "mode": "capture_only",
+          "debug_dir": "debug/star-backpack-probe"
+        }
+      }
+    },
+    "timeout": 15000,
+    "on_error": ["stop"]
+  }
+}
