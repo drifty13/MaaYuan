@@ -33,6 +33,24 @@
   ],
   "task": [
     {
+      "name": "开发调试｜星石背包截图探针",
+      "entry": "开发调试-星石背包截图探针",
+      "default_check": false,
+      "description": "请先手动进入「星石背包 → 主星 → 顶部」，再执行本任务。默认仅截取一张原始截图，不会自动滑动、不会 OCR、不会识别星石。"
+    },
+    {
+      "name": "开发调试｜星石背包单次滑动探针",
+      "entry": "开发调试-星石背包单次滑动探针",
+      "default_check": false,
+      "description": "请先手动进入「星石背包 → 主星 → 顶部」。本任务会自动向上滑动一次，请勿用于其他页面。"
+    },
+    {
+      "name": "开发调试｜星石背包反馈滑动探针",
+      "entry": "开发调试-星石背包反馈滑动探针",
+      "default_check": false,
+      "description": "请先进入「星石背包 → 主星 → 顶部」。本轮校准严格只执行一次 coarse swipe，完整等待 2500ms 后截图；无论诊断结果如何都不会自动追加 micro swipe。"
+    },
+    {
       "name": "🚀 启动biubiu加速器",
       "entry": "启动biubiu加速",
       "default_check": false,
