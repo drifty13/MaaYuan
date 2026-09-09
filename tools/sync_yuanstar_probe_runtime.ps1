@@ -36,12 +36,13 @@ function Copy-ProbeFile {
     Write-Host "已同步: $SourceRelativePath -> $RuntimeRelativePath"
 }
 
-# 只同步 B1a 至 B1f.2 所需 probe 文件（含单次滑动校准、真实位移 selector、direct normal proposer 与行 envelope 语义 overlap）；不触碰 config、日志、MaaYuan.exe、MFAAvalonia 或 Python runtime。
+# 只同步 B1 probe 与 B2 连续采集所需文件（含单次滑动校准、真实位移 selector、direct normal proposer、行 envelope 语义 overlap 与连续截图编排）；不触碰 config、日志、MaaYuan.exe、MFAAvalonia 或 Python runtime。
 Copy-ProbeFile -SourceRelativePath 'agent/custom/action/star_backpack_capture_probe.py' -RuntimeRelativePath 'agent/custom/action/star_backpack_capture_probe.py'
 Copy-ProbeFile -SourceRelativePath 'agent/custom/action/__init__.py' -RuntimeRelativePath 'agent/custom/action/__init__.py'
 Copy-ProbeFile -SourceRelativePath 'assets/resource/base/pipeline/star_backpack_capture_probe.json' -RuntimeRelativePath 'resource/base/pipeline/star_backpack_capture_probe.json'
 Copy-ProbeFile -SourceRelativePath 'assets/resource/base/pipeline/star_backpack_scroll_pair_probe.json' -RuntimeRelativePath 'resource/base/pipeline/star_backpack_scroll_pair_probe.json'
 Copy-ProbeFile -SourceRelativePath 'assets/resource/base/pipeline/star_backpack_feedback_probe.json' -RuntimeRelativePath 'resource/base/pipeline/star_backpack_feedback_probe.json'
+Copy-ProbeFile -SourceRelativePath 'assets/resource/base/pipeline/star_backpack_continuous_capture.json' -RuntimeRelativePath 'resource/base/pipeline/star_backpack_continuous_capture.json'
 
 $sourceInterfacePath = Join-Path $sourceRoot 'assets/interface.json'
 $runtimeInterfacePath = Join-Path $runtimeRoot 'interface.json'
@@ -58,7 +59,8 @@ if ($null -eq $sourceInterface.task -or $null -eq $runtimeInterface.task) {
 $probeNames = @(
     '开发调试｜星石背包截图探针',
     '开发调试｜星石背包单次滑动探针',
-    '开发调试｜星石背包反馈滑动探针'
+    '开发调试｜星石背包反馈滑动探针',
+    '开发调试｜星石背包连续采集'
 )
 $sourceTasksByName = @{}
 foreach ($probeName in $probeNames) {
@@ -69,7 +71,7 @@ foreach ($probeName in $probeNames) {
     $sourceTasksByName[$probeName] = $sourceTask[0]
 }
 
-# 仅增补或替换三个 probe 任务，保留 runtime 的 version、agent、controller、资源和所有其他任务。
+# 仅增补或替换四个星石背包任务，保留 runtime 的 version、agent、controller、资源和所有其他任务。
 $patchedTasks = New-Object System.Collections.Generic.List[object]
 $patchedNames = New-Object System.Collections.Generic.HashSet[string]
 $probeNames | ForEach-Object {
@@ -85,5 +87,5 @@ foreach ($task in @($runtimeInterface.task)) {
 Backup-TargetFile -Path $runtimeInterfacePath
 $runtimeInterface.task = $patchedTasks.ToArray()
 $runtimeInterface | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $runtimeInterfacePath -Encoding UTF8
-Write-Host "已安全 patch runtime interface.json（仅三个星石背包 probe task）"
+Write-Host "已安全 patch runtime interface.json（仅四个星石背包任务）"
 Write-Host "完成。每个改写目标已有同目录 .yuanstar-probe-backup-$backupTag 备份。"

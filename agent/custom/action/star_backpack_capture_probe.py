@@ -22,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 CAPTURE_ONLY_MODE = "capture_only"
 PAIR_PROBE_MODE = "pair_probe"
 FEEDBACK_PROBE_MODE = "feedback_probe"
+CONTINUOUS_CAPTURE_MODE = "continuous_capture"
 NORMAL_MOTION_MIN_PX = 560.0
 NORMAL_MOTION_MAX_PX = 660.0
 NORMAL_ACCEPTANCE_EPSILON_PX = 1.0
@@ -39,7 +40,12 @@ YUANSTAR_ENVELOPE_TOP_RADIUS = 1.06
 YUANSTAR_ENVELOPE_BOTTOM_RADIUS = 1.70
 SEMANTIC_ENVELOPE_SAFETY_MARGIN_PX = 10.0
 SUPPORTED_MODES = frozenset(
-    {CAPTURE_ONLY_MODE, PAIR_PROBE_MODE, FEEDBACK_PROBE_MODE}
+    {
+        CAPTURE_ONLY_MODE,
+        PAIR_PROBE_MODE,
+        FEEDBACK_PROBE_MODE,
+        CONTINUOUS_CAPTURE_MODE,
+    }
 )
 
 
@@ -205,14 +211,16 @@ def parse_capture_probe_params(raw: Any) -> dict[str, Any]:
     params = _parse_params(raw)
     mode = params.get("mode", CAPTURE_ONLY_MODE)
     if not isinstance(mode, str) or mode not in SUPPORTED_MODES:
-        raise ValueError("mode 必须是 capture_only、pair_probe 或 feedback_probe")
+        raise ValueError(
+            "mode 必须是 capture_only、pair_probe、feedback_probe 或 continuous_capture"
+        )
 
     debug_dir = params.get("debug_dir", "debug/star-backpack-probe")
     if not isinstance(debug_dir, str) or not debug_dir.strip():
         raise ValueError("debug_dir 必须是非空路径字符串")
 
     parsed: dict[str, Any] = {"mode": mode, "debug_dir": debug_dir.strip()}
-    if mode in {PAIR_PROBE_MODE, FEEDBACK_PROBE_MODE}:
+    if mode in {PAIR_PROBE_MODE, FEEDBACK_PROBE_MODE, CONTINUOUS_CAPTURE_MODE}:
         if "compare_roi" not in params:
             raise ValueError(f"{mode} 必须显式提供 compare_roi")
         parsed["compare_roi"] = _parse_rect(params["compare_roi"], "compare_roi")
@@ -256,6 +264,18 @@ def parse_capture_probe_params(raw: Any) -> dict[str, Any]:
             params.get("single_swipe_calibration"),
             "single_swipe_calibration",
         )
+        parsed["feedback"] = _parse_diagnostic_feedback(params.get("feedback"))
+    if mode == CONTINUOUS_CAPTURE_MODE:
+        parsed["settle_ms"] = _parse_int(
+            params.get("settle_ms"), "settle_ms", minimum=0
+        )
+        parsed["swipe"] = _parse_swipe(params.get("swipe"))
+        max_transitions = _parse_int(
+            params.get("max_transitions"), "max_transitions", minimum=1
+        )
+        if max_transitions > 50:
+            raise ValueError("max_transitions 不能超过 50")
+        parsed["max_transitions"] = max_transitions
         parsed["feedback"] = _parse_diagnostic_feedback(params.get("feedback"))
     return parsed
 
@@ -1466,6 +1486,69 @@ def evaluate_feedback_candidate(
     }
 
 
+def _feedback_metrics_contract(evaluation: dict[str, Any]) -> dict[str, Any]:
+    """Project an internal feedback evaluation onto the stable JSON contract.
+
+    Candidate selection, row-lattice geometry, thresholds, and retry reasons
+    remain local implementation details.  B2 only needs the final transition
+    decision plus a small amount of non-duplicated diagnostic evidence.
+    """
+    return {
+        "accepted": evaluation["accepted"],
+        "relation": evaluation["relation"],
+        "ocr_overlap_pair_required": evaluation["ocr_overlap_pair_required"],
+        "semantic_overlap_state": evaluation["semantic_overlap_state"],
+        "section_complete": evaluation["section_complete"],
+        "image_pair": evaluation["image_pair"],
+        "diagnostics": {
+            "actual_shift_px": evaluation["actual_shift_px"],
+            "motion_reliability": evaluation["motion_reliability"]["mode"],
+            "physical_overlap_px": evaluation["physical_overlap_px"],
+        },
+    }
+
+
+def _evaluate_continuous_transition(
+    prev_roi: np.ndarray,
+    candidate_roi: np.ndarray,
+    feedback: dict[str, Any],
+) -> dict[str, Any]:
+    """Reuse the B1 decision and expose only its stable transition contract."""
+    evaluation = evaluate_feedback_candidate(prev_roi, candidate_roi, feedback)
+    semantic_state = evaluation["semantic_overlap_state"]
+    return _feedback_metrics_contract(
+        {
+            **evaluation,
+            "section_complete": semantic_state == "not_applicable_no_move",
+            "image_pair": None,
+        }
+    )
+
+
+def _is_capture_safe_progress(
+    transition: dict[str, Any], feedback: dict[str, Any]
+) -> bool:
+    """Accept reliable forward progress even when B1 marks it inefficient.
+
+    B1's ``accepted`` flag deliberately includes its target-stride efficiency
+    window. B2 instead needs a conservative capture rule: retain any reliable
+    positive movement that cannot have skipped a row according to B1's
+    already-configured physical and normal-safe bounds.
+    """
+    if transition["diagnostics"]["motion_reliability"] == "unreliable":
+        return False
+    actual_shift_px = transition["diagnostics"]["actual_shift_px"]
+    if not isinstance(actual_shift_px, (int, float)):
+        return False
+    physical_min, _ = feedback["diagnostic_physical_shift_px"]
+    _, normal_safe_max = feedback["diagnostic_normal_safe_shift_px"]
+    return (
+        physical_min
+        <= actual_shift_px
+        <= normal_safe_max + NORMAL_ACCEPTANCE_EPSILON_PX
+    )
+
+
 def _gesture_payload(gesture: tuple[int, int, int, int, int]) -> dict[str, Any]:
     return {
         "start": [gesture[0], gesture[1]],
@@ -1485,6 +1568,90 @@ class StarBackpackCaptureProbe(CustomAction):
         if not isinstance(image, np.ndarray):
             raise RuntimeError("controller screenshot 不是 NumPy 图像")
         return image
+
+    def _run_continuous_capture(
+        self,
+        context: Context,
+        params: dict[str, Any],
+        run_dir: Path,
+        initial: np.ndarray,
+    ) -> dict[str, Any]:
+        """Capture adjacent main-star pages using one B1-evaluated swipe at a time."""
+        retained_images = ["capture-00.png"]
+        _write_png(run_dir / retained_images[0], initial)
+        prev = initial
+        prev_roi = _crop_roi(prev, params["compare_roi"])
+        transition_count = 0
+        failed_transition: int | None = None
+        stop_reason = "transition_limit_reached"
+        success = False
+        last_semantic_overlap_state: str | None = None
+        last_motion_reliability: str | None = None
+        last_actual_shift_px: float | None = None
+
+        for transition_index in range(1, params["max_transitions"] + 1):
+            # The B2 loop is deliberately a single gesture.  Retry and motion
+            # policy remain B1 concerns; this layer never adds a second swipe.
+            context.tasker.controller.post_swipe(*params["swipe"]).wait()
+            transition_count = transition_index
+            if params["settle_ms"]:
+                time.sleep(params["settle_ms"] / 1000)
+            candidate = self._capture(context)
+            candidate_roi = _crop_roi(candidate, params["compare_roi"])
+            transition = _evaluate_continuous_transition(
+                prev_roi, candidate_roi, params["feedback"]
+            )
+            last_semantic_overlap_state = transition["semantic_overlap_state"]
+            last_motion_reliability = transition["diagnostics"][
+                "motion_reliability"
+            ]
+            last_actual_shift_px = transition["diagnostics"]["actual_shift_px"]
+
+            if _is_capture_safe_progress(transition, params["feedback"]):
+                image_name = f"capture-{len(retained_images):02d}.png"
+                _write_png(run_dir / image_name, candidate)
+                retained_images.append(image_name)
+                prev = candidate
+                prev_roi = candidate_roi
+                continue
+
+            if last_semantic_overlap_state == "not_applicable_no_move":
+                if len(retained_images) > 1:
+                    success = True
+                    stop_reason = "bottom_no_move"
+                else:
+                    stop_reason = "no_move_before_progress"
+                    failed_transition = transition_index
+            elif last_semantic_overlap_state == "not_applicable_unreliable_motion":
+                stop_reason = "unreliable_transition"
+                failed_transition = transition_index
+            else:
+                stop_reason = "rejected_transition"
+                failed_transition = transition_index
+            if stop_reason in {"unreliable_transition", "rejected_transition"}:
+                _write_png(
+                    run_dir / f"failed-candidate-{transition_index:02d}.png",
+                    candidate,
+                )
+            break
+        else:
+            failed_transition = transition_count
+
+        session = {
+            "success": success,
+            "stop_reason": stop_reason,
+            "retained_images": retained_images,
+            "retained_image_count": len(retained_images),
+            "transition_count": transition_count,
+            "failed_transition": failed_transition,
+            "diagnostics": {
+                "last_semantic_overlap_state": last_semantic_overlap_state,
+                "last_motion_reliability": last_motion_reliability,
+                "last_actual_shift_px": last_actual_shift_px,
+            },
+        }
+        _write_json(run_dir / "session.json", session)
+        return session
 
     def _run_feedback_probe(
         self,
@@ -1651,7 +1818,6 @@ class StarBackpackCaptureProbe(CustomAction):
             {
                 "previous_image_id": "prev.png",
                 "current_image_id": "candidate.png",
-                "relation": "overlap",
             }
             if (
                 final_evaluation["accepted"]
@@ -1660,8 +1826,9 @@ class StarBackpackCaptureProbe(CustomAction):
             )
             else None
         )
-        _write_json(run_dir / "feedback-metrics.json", final_evaluation)
-        return final_evaluation
+        metrics = _feedback_metrics_contract(final_evaluation)
+        _write_json(run_dir / "feedback-metrics.json", metrics)
+        return metrics
 
     def run(
         self, context: Context, argv: CustomAction.RunArg
@@ -1708,14 +1875,23 @@ class StarBackpackCaptureProbe(CustomAction):
                     f"overlap={metrics['best_overlap_score']:.4f}, "
                     f"overlap_px={metrics['best_overlap_px']}, dir={run_dir}"
                 )
-            else:
+                return CustomAction.RunResult(success=True)
+            elif params["mode"] == FEEDBACK_PROBE_MODE:
                 metrics = self._run_feedback_probe(context, params, run_dir, before)
                 logger.info(
                     "星石背包 feedback_probe 完成（仅诊断）: "
-                    f"accepted={metrics['accepted']}, reason={metrics['reason']}, "
-                    f"attempts={len(metrics['attempts'])}, dir={run_dir}"
+                    f"accepted={metrics['accepted']}, "
+                    f"section_complete={metrics['section_complete']}, dir={run_dir}"
                 )
-            return CustomAction.RunResult(success=True)
+                return CustomAction.RunResult(success=True)
+
+            session = self._run_continuous_capture(context, params, run_dir, before)
+            logger.info(
+                "星石背包连续采集完成: "
+                f"success={session['success']}, stop={session['stop_reason']}, "
+                f"images={session['retained_image_count']}, dir={run_dir}"
+            )
+            return CustomAction.RunResult(success=session["success"])
         except Exception as exc:
             logger.exception(f"星石背包截图探针失败: {exc}")
             return CustomAction.RunResult(success=False)
