@@ -770,6 +770,9 @@ def _select_motion_hypothesis(
     expected_shift_px: tuple[int, int] | None,
     physical_shift_px: tuple[int, int] | None,
     direct_normal_search: dict[str, Any] | None = None,
+    *,
+    terminal_confirmed: bool = False,
+    terminal_max_shift_px: float | None = None,
 ) -> tuple[_MotionHypothesis | None, dict[str, Any] | None, list[dict[str, Any]]]:
     """Prefer a verified normal-motion branch before terminal fallback.
 
@@ -842,6 +845,22 @@ def _select_motion_hypothesis(
     ]
     if not physical_candidates:
         return None, None, debug_hypotheses
+    terminal_candidates = [
+        item
+        for item in physical_candidates
+        if (
+            terminal_confirmed
+            and terminal_max_shift_px is not None
+            and 0 < item["hypothesis"].shift_y <= terminal_max_shift_px
+            and len(item["hypothesis"].matches) >= 4
+            and item["hypothesis"].median_abs_deviation <= 12.0
+            and item["hypothesis"].full_overlap_score is not None
+            and item["hypothesis"].full_overlap_score >= DIRECT_NORMAL_MIN_SCORE
+            and item["hypothesis"].full_overlap_height_px >= MIN_DIRECT_OVERLAP_PX
+            and item["hypothesis"].anchor_score is not None
+            and item["hypothesis"].anchor_score >= DIRECT_NORMAL_MIN_SCORE
+        )
+    ]
     normal_candidates = [
         item
         for item in physical_candidates
@@ -859,7 +878,16 @@ def _select_motion_hypothesis(
             )
         )
     ]
-    if normal_candidates:
+    if terminal_confirmed:
+        if not terminal_candidates:
+            return None, None, debug_hypotheses
+        selected_item = max(
+            terminal_candidates, key=lambda item: item["fallback_selection_score"]
+        )
+        selection_mode = "terminal_confirmed_short_motion"
+        selected_by = "terminal_confirmed_evidence"
+        selection_score = selected_item["fallback_selection_score"]
+    elif normal_candidates:
         selected_item = max(normal_candidates, key=lambda item: item["normal_selection_score"])
         selection_mode = "normal_motion_full_overlap"
         selected_by = "full_overlap_score"
@@ -884,7 +912,7 @@ def _select_motion_hypothesis(
             "selection_mode": selection_mode,
             "normal_motion_candidate_count": len(normal_candidates),
             "selected_by": selected_by,
-            "fallback_used": not bool(normal_candidates),
+            "fallback_used": selection_mode != "normal_motion_full_overlap",
         }
     )
     return selected, selected_reason, debug_hypotheses
@@ -913,6 +941,9 @@ def estimate_vertical_motion(
     after_roi: np.ndarray,
     expected_shift_px: tuple[int, int] | None = None,
     physical_shift_px: tuple[int, int] | None = None,
+    *,
+    terminal_confirmed: bool = False,
+    terminal_max_shift_px: float | None = None,
 ) -> MotionEstimate:
     """Estimate one vertical page shift with hypothesis clustering then cluster RANSAC.
 
@@ -937,7 +968,12 @@ def estimate_vertical_motion(
     if before_descriptors is None or after_descriptors is None:
         hypotheses = _merge_direct_normal_candidate([], direct_candidate)
         selected, selected_reason, debug_hypotheses = _select_motion_hypothesis(
-            hypotheses, expected_shift_px, physical_shift_px, direct_normal_search
+            hypotheses,
+            expected_shift_px,
+            physical_shift_px,
+            direct_normal_search,
+            terminal_confirmed=terminal_confirmed,
+            terminal_max_shift_px=terminal_max_shift_px,
         )
         if selected is not None and selected_reason is not None:
             return _direct_candidate_motion_estimate(
@@ -977,7 +1013,12 @@ def estimate_vertical_motion(
     if len(positive_matches) < 3:
         hypotheses = _merge_direct_normal_candidate([], direct_candidate)
         selected, selected_reason, debug_hypotheses = _select_motion_hypothesis(
-            hypotheses, expected_shift_px, physical_shift_px, direct_normal_search
+            hypotheses,
+            expected_shift_px,
+            physical_shift_px,
+            direct_normal_search,
+            terminal_confirmed=terminal_confirmed,
+            terminal_max_shift_px=terminal_max_shift_px,
         )
         if selected is not None and selected_reason is not None:
             return _direct_candidate_motion_estimate(
@@ -999,7 +1040,12 @@ def estimate_vertical_motion(
     _apply_direct_overlap_anchors(hypotheses, before_roi, after_roi)
     hypotheses = _merge_direct_normal_candidate(hypotheses, direct_candidate)
     selected, selected_reason, debug_hypotheses = _select_motion_hypothesis(
-        hypotheses, expected_shift_px, physical_shift_px, direct_normal_search
+        hypotheses,
+        expected_shift_px,
+        physical_shift_px,
+        direct_normal_search,
+        terminal_confirmed=terminal_confirmed,
+        terminal_max_shift_px=terminal_max_shift_px,
     )
     if selected is None or selected_reason is None:
         return MotionEstimate(
@@ -1238,7 +1284,7 @@ def evaluate_semantic_row_overlap(
         }
         if clearance >= safety_margin:
             full_rows.append(row_evidence)
-        elif clearance >= -safety_margin:
+        elif clearance >= 0:
             ambiguous_rows.append(row_evidence)
     if full_rows:
         state = "definitely_full_row"
@@ -1549,6 +1595,87 @@ def _is_capture_safe_progress(
     )
 
 
+def _terminal_confirmed_overlap_pair_required(
+    prev_roi: np.ndarray,
+    candidate_roi: np.ndarray,
+    feedback: dict[str, Any],
+) -> bool:
+    """Recheck only the final retained pair after the next frame confirms bottom.
+
+    Normal continuous transitions keep their normal-band protection. This narrow
+    path can select a shorter ORB-supported movement only after the following
+    transition has independently established ``bottom_no_move``.
+    """
+    physical_min, _ = feedback["diagnostic_physical_shift_px"]
+    terminal_max_shift_px = feedback["diagnostic_micro_trigger_shift_px"]
+    estimate = estimate_vertical_motion(
+        prev_roi,
+        candidate_roi,
+        feedback["diagnostic_expected_shift_px"],
+        feedback["diagnostic_physical_shift_px"],
+        terminal_confirmed=True,
+        terminal_max_shift_px=float(terminal_max_shift_px),
+    )
+    selected = estimate.selected_hypothesis
+    if (
+        selected is None
+        or not physical_min <= estimate.shift_y <= terminal_max_shift_px
+        or estimate.match_count < 4
+        or estimate.inlier_count < 4
+        or estimate.confidence < feedback["diagnostic_min_confidence"]
+        or selected.get("proposal_source") == "direct_normal_band"
+        or selected.get("full_overlap_score", 0.0) < DIRECT_NORMAL_MIN_SCORE
+        or selected.get("anchor_score", 0.0) < DIRECT_NORMAL_MIN_SCORE
+    ):
+        return False
+    local_score, _, local_valid = _local_overlap_confirmation(
+        prev_roi,
+        candidate_roi,
+        estimate.shift_y,
+        feedback["local_search_radius_px"],
+    )
+    if (
+        not local_valid
+        or local_score is None
+        or local_score < feedback["diagnostic_min_local_overlap_score"]
+    ):
+        return False
+    semantic_overlap = evaluate_semantic_row_overlap(
+        prev_roi,
+        candidate_roi,
+        estimate.shift_y,
+        feedback["diagnostic_row_pitch_px"],
+    )
+    if (
+        semantic_overlap["semantic_overlap_state"]
+        in {"definitely_full_row", "ambiguous"}
+        and semantic_overlap["ocr_overlap_pair_required"] is True
+    ):
+        return True
+
+    # The terminal pair can lose the prior frame's lattice phase when the list
+    # header leaves the compare ROI. The selected ORB/RANSAC transform and the
+    # full/local-overlap checks above already establish the two frames' pixel
+    # correspondence. Re-anchor only the independently detected candidate rows
+    # through that transform, then reuse the unchanged row-envelope decision.
+    candidate_row_centers = semantic_overlap["candidate_row_centers"]
+    if not candidate_row_centers:
+        return False
+    reanchored_semantic_overlap = evaluate_semantic_row_overlap(
+        prev_roi,
+        candidate_roi,
+        estimate.shift_y,
+        feedback["diagnostic_row_pitch_px"],
+        prev_row_centers=[center + estimate.shift_y for center in candidate_row_centers],
+        candidate_row_centers=candidate_row_centers,
+    )
+    return (
+        reanchored_semantic_overlap["semantic_overlap_state"]
+        in {"definitely_full_row", "ambiguous"}
+        and reanchored_semantic_overlap["ocr_overlap_pair_required"] is True
+    )
+
+
 def _gesture_payload(gesture: tuple[int, int, int, int, int]) -> dict[str, Any]:
     return {
         "start": [gesture[0], gesture[1]],
@@ -1578,6 +1705,7 @@ class StarBackpackCaptureProbe(CustomAction):
     ) -> dict[str, Any]:
         """Capture adjacent main-star pages using one B1-evaluated swipe at a time."""
         retained_images = ["capture-00.png"]
+        adjacent_relations: list[dict[str, str]] = []
         _write_png(run_dir / retained_images[0], initial)
         prev = initial
         prev_roi = _crop_roi(prev, params["compare_roi"])
@@ -1588,6 +1716,7 @@ class StarBackpackCaptureProbe(CustomAction):
         last_semantic_overlap_state: str | None = None
         last_motion_reliability: str | None = None
         last_actual_shift_px: float | None = None
+        last_retained_pair_rois: tuple[np.ndarray, np.ndarray] | None = None
 
         for transition_index in range(1, params["max_transitions"] + 1):
             # The B2 loop is deliberately a single gesture.  Retry and motion
@@ -1608,9 +1737,19 @@ class StarBackpackCaptureProbe(CustomAction):
             last_actual_shift_px = transition["diagnostics"]["actual_shift_px"]
 
             if _is_capture_safe_progress(transition, params["feedback"]):
+                previous_image = retained_images[-1]
                 image_name = f"capture-{len(retained_images):02d}.png"
                 _write_png(run_dir / image_name, candidate)
                 retained_images.append(image_name)
+                last_retained_pair_rois = (prev_roi, candidate_roi)
+                if transition["ocr_overlap_pair_required"] is True:
+                    adjacent_relations.append(
+                        {
+                            "previous_image": previous_image,
+                            "current_image": image_name,
+                            "relation": "overlap",
+                        }
+                    )
                 prev = candidate
                 prev_roi = candidate_roi
                 continue
@@ -1619,6 +1758,28 @@ class StarBackpackCaptureProbe(CustomAction):
                 if len(retained_images) > 1:
                     success = True
                     stop_reason = "bottom_no_move"
+                    final_pair = (retained_images[-2], retained_images[-1])
+                    final_pair_has_relation = any(
+                        relation["previous_image"] == final_pair[0]
+                        and relation["current_image"] == final_pair[1]
+                        for relation in adjacent_relations
+                    )
+                    if (
+                        not final_pair_has_relation
+                        and last_retained_pair_rois is not None
+                        and _terminal_confirmed_overlap_pair_required(
+                            last_retained_pair_rois[0],
+                            last_retained_pair_rois[1],
+                            params["feedback"],
+                        )
+                    ):
+                        adjacent_relations.append(
+                            {
+                                "previous_image": final_pair[0],
+                                "current_image": final_pair[1],
+                                "relation": "overlap",
+                            }
+                        )
                 else:
                     stop_reason = "no_move_before_progress"
                     failed_transition = transition_index
@@ -1642,6 +1803,7 @@ class StarBackpackCaptureProbe(CustomAction):
             "stop_reason": stop_reason,
             "retained_images": retained_images,
             "retained_image_count": len(retained_images),
+            "adjacent_relations": adjacent_relations,
             "transition_count": transition_count,
             "failed_transition": failed_transition,
             "diagnostics": {
