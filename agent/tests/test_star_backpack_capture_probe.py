@@ -24,6 +24,8 @@ _SPEC.loader.exec_module(_MODULE)
 compute_visual_overlap = _MODULE.compute_visual_overlap
 estimate_vertical_motion = _MODULE.estimate_vertical_motion
 evaluate_feedback_candidate = _MODULE.evaluate_feedback_candidate
+feedback_metrics_contract = _MODULE._feedback_metrics_contract
+is_capture_safe_progress = _MODULE._is_capture_safe_progress
 evaluate_semantic_row_overlap = _MODULE.evaluate_semantic_row_overlap
 estimate_row_lattice = _MODULE._estimate_row_lattice
 local_overlap_confirmation = _MODULE._local_overlap_confirmation
@@ -146,6 +148,45 @@ def _b1d_feedback_config():
     }
 
 
+def _continuous_capture_params(directory, max_transitions=5, height=760):
+    return {
+        "mode": "continuous_capture",
+        "debug_dir": directory,
+        "compare_roi": [0, 0, 240, height],
+        "swipe": {
+            "start": [360, 930],
+            "end": [360, 540],
+            "duration_ms": 700,
+        },
+        "settle_ms": 0,
+        "max_transitions": max_transitions,
+        "feedback": _b1d_feedback_config(),
+    }
+
+
+def _b1_transition_evaluation(
+    state,
+    accepted,
+    *,
+    actual_shift_px=None,
+    motion_reliability="orb_confidence",
+):
+    pair_required = state in {"definitely_full_row", "ambiguous"}
+    return {
+        "accepted": accepted,
+        "relation": "overlap" if accepted and pair_required else None,
+        "ocr_overlap_pair_required": pair_required,
+        "semantic_overlap_state": state,
+        "motion_reliability": {"mode": motion_reliability},
+        "actual_shift_px": (
+            actual_shift_px
+            if actual_shift_px is not None
+            else (620.0 if accepted else 0.0)
+        ),
+        "physical_overlap_px": 140.0 if accepted else 760.0,
+    }
+
+
 class StarBackpackCaptureProbeParamsTests(unittest.TestCase):
     def test_capture_only_uses_safe_defaults(self):
         self.assertEqual(
@@ -217,6 +258,51 @@ class StarBackpackCaptureProbeParamsTests(unittest.TestCase):
         self.assertTrue(parsed["single_swipe_calibration"])
         self.assertEqual(parsed["coarse_swipe"], (360, 930, 360, 540, 700))
         self.assertEqual(parsed["settle_ms"], 2500)
+
+    def test_continuous_capture_requires_a_bounded_transition_count(self):
+        with self.assertRaisesRegex(ValueError, "max_transitions"):
+            parse_capture_probe_params(
+                {
+                    "mode": "continuous_capture",
+                    "compare_roi": [0, 0, 240, 760],
+                    "swipe": {
+                        "start": [360, 930],
+                        "end": [360, 540],
+                        "duration_ms": 700,
+                    },
+                    "settle_ms": 2500,
+                    "feedback": _b1d_feedback_config(),
+                }
+            )
+
+    def test_continuous_capture_pipeline_uses_the_locked_single_swipe(self):
+        pipeline_path = (
+            AGENT_ROOT.parent
+            / "assets"
+            / "resource"
+            / "base"
+            / "pipeline"
+            / "star_backpack_continuous_capture.json"
+        )
+        pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))
+        params = pipeline["开发调试-星石背包连续采集"]["action"]["param"][
+            "custom_action_param"
+        ]
+        parsed = parse_capture_probe_params(params)
+        self.assertEqual(parsed["mode"], "continuous_capture")
+        self.assertEqual(parsed["swipe"], (360, 930, 360, 540, 700))
+        self.assertEqual(parsed["settle_ms"], 2500)
+        self.assertEqual(parsed["max_transitions"], 20)
+        self.assertEqual(parsed["feedback"]["diagnostic_min_confidence"], 0.20)
+        interface = json.loads(
+            (AGENT_ROOT.parent / "assets" / "interface.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIn(
+            "开发调试｜星石背包连续采集",
+            {task["name"] for task in interface["task"]},
+        )
 
 
 class StarBackpackCaptureProbeVisualTests(unittest.TestCase):
@@ -484,13 +570,24 @@ class StarBackpackCaptureProbeFeedbackTests(unittest.TestCase):
             self.assertEqual(metrics["relation"], "overlap")
             self.assertTrue(metrics["ocr_overlap_pair_required"])
             self.assertIsNotNone(metrics["image_pair"])
-            self.assertEqual(metrics["efficiency_status"], "terminal_partial")
-            self.assertTrue(metrics["terminal_partial_confirmed"])
-            self.assertEqual(len(metrics["attempts"]), 2)
-            self.assertIn("motion_hypotheses", metrics["shift_estimate"])
-            self.assertIn("selected_hypothesis", metrics["shift_estimate"])
-            self.assertIn("direction_rejected_match_count", metrics["shift_estimate"])
-            self.assertTrue(metrics["local_overlap_valid"])
+            self.assertTrue(metrics["section_complete"])
+            self.assertEqual(
+                set(metrics),
+                {
+                    "accepted",
+                    "relation",
+                    "ocr_overlap_pair_required",
+                    "semantic_overlap_state",
+                    "section_complete",
+                    "image_pair",
+                    "diagnostics",
+                },
+            )
+            self.assertEqual(
+                set(metrics["diagnostics"]),
+                {"actual_shift_px", "motion_reliability", "physical_overlap_px"},
+            )
+            self.assertNotIn("relation", metrics["image_pair"])
             self.assertEqual(len(context.tasker.controller.swipes), 2)
             self.assertTrue((run_dir / "prev.png").is_file())
             self.assertTrue((run_dir / "candidate.png").is_file())
@@ -527,7 +624,11 @@ class StarBackpackCaptureProbeFeedbackTests(unittest.TestCase):
                         (run_dir / "feedback-metrics.json").read_text(encoding="utf-8")
                     )
                     self.assertEqual(metrics["accepted"], expected_accepted)
-                    self.assertEqual(metrics["reason"], expected_reason)
+                    self.assertNotIn("reason", metrics)
+                    self.assertEqual(
+                        evaluate_feedback_candidate(prev, candidate, params["feedback"])["reason"],
+                        expected_reason,
+                    )
                     self.assertEqual(len(context.tasker.controller.swipes), 1)
 
     def test_correct_large_shift_still_rejects_outside_safe_range(self):
@@ -886,38 +987,42 @@ class StarBackpackCaptureProbeFeedbackTests(unittest.TestCase):
         self.assertEqual(result["reason"], "efficiency_correction_required")
         self.assertEqual(result["efficiency_status"], "conservative")
 
-    def test_feedback_metrics_keep_only_unique_motion_diagnostics(self):
+    def test_feedback_metrics_contract_keeps_only_final_control_and_diagnostics(self):
         before = _complex_scene(height=760, width=240, seed=931)
-        result = evaluate_feedback_candidate(
+        evaluation = evaluate_feedback_candidate(
             before, _shift_up(before, 620, seed=932), _b1d_feedback_config()
         )
+        evaluation["section_complete"] = False
+        evaluation["image_pair"] = None
+        result = feedback_metrics_contract(evaluation)
         for removed in (
-            "motion_hypotheses",
-            "selected_hypothesis",
-            "direction_rejected_match_count",
-            "direct_normal_search",
-            "visual_overlap_px",
-            "prev_row_centers",
-            "candidate_row_centers",
-            "anchor_score",
-            "selected_hypothesis_reason",
+            "shift_estimate",
+            "same_position_score",
+            "local_overlap_score",
+            "local_overlap_valid",
+            "reason",
+            "efficiency_status",
+            "row_lattice",
+            "full_row_candidates",
+            "attempts",
         ):
             self.assertNotIn(removed, result)
-        self.assertIn("motion_hypotheses", result["shift_estimate"])
-        self.assertIn("selected_hypothesis", result["shift_estimate"])
-        self.assertIn("direct_normal_search", result["shift_estimate"])
-        for retained in (
-            "motion_reliability",
-            "actual_shift_px",
-            "true_shift_rows",
-            "physical_overlap_px",
-            "semantic_overlap_state",
-            "ocr_overlap_pair_required",
-            "full_row_candidates",
-            "accepted",
-            "reason",
-        ):
-            self.assertIn(retained, result)
+        self.assertEqual(
+            set(result),
+            {
+                "accepted",
+                "relation",
+                "ocr_overlap_pair_required",
+                "semantic_overlap_state",
+                "section_complete",
+                "image_pair",
+                "diagnostics",
+            },
+        )
+        self.assertEqual(
+            set(result["diagnostics"]),
+            {"actual_shift_px", "motion_reliability", "physical_overlap_px"},
+        )
 
     def test_low_orb_confidence_with_strong_merged_direct_evidence_is_reliable(self):
         before = _complex_scene(height=760, width=240, seed=901)
@@ -1044,10 +1149,8 @@ class StarBackpackCaptureProbeFeedbackTests(unittest.TestCase):
                 (run_dir / "feedback-metrics.json").read_text(encoding="utf-8")
             )
             self.assertTrue(metrics["accepted"])
-            self.assertEqual(metrics["efficiency_status"], "semantic_zero_overlap_target")
             self.assertFalse(metrics["ocr_overlap_pair_required"])
             self.assertIsNone(metrics["image_pair"])
-            self.assertEqual([item["stage"] for item in metrics["attempts"]], ["coarse", "efficiency_micro"])
             self.assertEqual(len(context.tasker.controller.swipes), 2)
 
     def test_single_swipe_calibration_ends_after_coarse_for_every_diagnostic_reason(self):
@@ -1101,6 +1204,12 @@ class StarBackpackCaptureProbeFeedbackTests(unittest.TestCase):
                     "settle_ms": 0,
                     "feedback": _b1d_feedback_config(),
                 }
+                self.assertEqual(
+                    evaluate_feedback_candidate(prev, candidate, params["feedback"])[
+                        "reason"
+                    ],
+                    expected_reason,
+                )
                 with tempfile.TemporaryDirectory() as directory:
                     params["debug_dir"] = directory
                     context = _FakeCaptureContext([prev, candidate, candidate])
@@ -1112,10 +1221,9 @@ class StarBackpackCaptureProbeFeedbackTests(unittest.TestCase):
                     metrics = json.loads(
                         (run_dir / "feedback-metrics.json").read_text(encoding="utf-8")
                     )
-                    self.assertEqual(metrics["reason"], expected_reason)
-                    self.assertTrue(metrics["single_swipe_calibration"])
-                    self.assertEqual(metrics["gesture_count"], 1)
-                    self.assertEqual([item["stage"] for item in metrics["attempts"]], ["coarse"])
+                    self.assertNotIn("reason", metrics)
+                    self.assertNotIn("single_swipe_calibration", metrics)
+                    self.assertNotIn("attempts", metrics)
                     self.assertEqual(len(context.tasker.controller.swipes), 1)
                     self.assertTrue((run_dir / "prev.png").is_file())
                     self.assertTrue((run_dir / "prev-roi.png").is_file())
@@ -1163,7 +1271,6 @@ class StarBackpackCaptureProbeFeedbackTests(unittest.TestCase):
                 (run_dir / "feedback-metrics.json").read_text(encoding="utf-8")
             )
             self.assertTrue(metrics["accepted"])
-            self.assertTrue(metrics["terminal_partial_confirmed"])
             self.assertTrue(metrics["section_complete"])
             self.assertTrue((run_dir / "candidate.png").is_file())
             self.assertFalse((run_dir / "candidate-02.png").exists())
@@ -1200,7 +1307,7 @@ class StarBackpackCaptureProbeFeedbackTests(unittest.TestCase):
                 (run_dir / "feedback-metrics.json").read_text(encoding="utf-8")
             )
         self.assertTrue(metrics["accepted"])
-        self.assertTrue(metrics["terminal_partial_confirmed"])
+        self.assertTrue(metrics["section_complete"])
         self.assertFalse(metrics["ocr_overlap_pair_required"])
         self.assertIsNone(metrics["relation"])
         self.assertIsNone(metrics["image_pair"])
@@ -1234,7 +1341,6 @@ class StarBackpackCaptureProbeFeedbackTests(unittest.TestCase):
                 (run_dir / "feedback-metrics.json").read_text(encoding="utf-8")
             )
             self.assertTrue(metrics["accepted"])
-            self.assertEqual(metrics["efficiency_status"], "semantic_zero_overlap_target")
             self.assertFalse(metrics["ocr_overlap_pair_required"])
             self.assertIsNone(metrics["image_pair"])
             self.assertFalse(metrics["section_complete"])
@@ -1247,6 +1353,384 @@ class StarBackpackCaptureProbeFeedbackTests(unittest.TestCase):
         )
         self.assertFalse(result["accepted"])
         self.assertEqual(result["reason"], "unsafe_gap_risk")
+
+
+class StarBackpackContinuousCaptureTests(unittest.TestCase):
+    def _session(self, directory):
+        run_dir = next(Path(directory).iterdir())
+        return run_dir, json.loads((run_dir / "session.json").read_text(encoding="utf-8"))
+
+    def test_multiple_normal_transitions_keep_every_business_screenshot_until_bottom(self):
+        initial = _complex_scene(height=760, width=240, seed=1401)
+        first = _shift_up(initial, 620, seed=1402)
+        second = _shift_up(first, 620, seed=1403)
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, first, second, second])
+            result = StarBackpackCaptureProbe().run(
+                context,
+                SimpleNamespace(
+                    custom_action_param=_continuous_capture_params(directory)
+                ),
+            )
+            run_dir, session = self._session(directory)
+            has_last_retained_image = (run_dir / "capture-02.png").is_file()
+            has_extra_retained_image = (run_dir / "capture-03.png").exists()
+            has_failed_candidate = (run_dir / "failed-candidate-03.png").exists()
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertEqual(session["stop_reason"], "bottom_no_move")
+        self.assertEqual(session["transition_count"], 3)
+        self.assertEqual(session["retained_images"], [
+            "capture-00.png", "capture-01.png", "capture-02.png",
+        ])
+        self.assertEqual(session["retained_image_count"], 3)
+        self.assertIsNone(session["failed_transition"])
+        self.assertEqual(len(context.tasker.controller.swipes), 3)
+        self.assertTrue(has_last_retained_image)
+        self.assertFalse(has_extra_retained_image)
+        self.assertFalse(has_failed_candidate)
+
+    def test_physical_overlap_without_full_row_still_keeps_next_screenshot(self):
+        initial = _complex_scene(height=760, width=240, seed=1411)
+        next_image = _shift_up(initial, 620, seed=1412)
+        initial_evaluation = evaluate_feedback_candidate(
+            initial, next_image, _b1d_feedback_config()
+        )
+        self.assertGreater(initial_evaluation["physical_overlap_px"], 0)
+        self.assertEqual(
+            initial_evaluation["semantic_overlap_state"], "definitely_no_full_row"
+        )
+        self.assertFalse(initial_evaluation["ocr_overlap_pair_required"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, next_image, next_image])
+            result = StarBackpackCaptureProbe().run(
+                context,
+                SimpleNamespace(
+                    custom_action_param=_continuous_capture_params(directory)
+                ),
+            )
+            _, session = self._session(directory)
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertEqual(session["retained_image_count"], 2)
+        self.assertEqual(len(context.tasker.controller.swipes), 2)
+
+    def test_593px_reliable_under_target_is_retained_until_bottom(self):
+        initial = _complex_scene(height=760, width=240, seed=1471)
+        candidate = _shift_up(initial, 593, seed=1472)
+        evaluation = evaluate_feedback_candidate(
+            initial, candidate, _b1d_feedback_config()
+        )
+        self.assertFalse(evaluation["accepted"])
+        self.assertEqual(
+            evaluation["semantic_overlap_state"], "definitely_no_full_row"
+        )
+        self.assertNotEqual(evaluation["motion_reliability"]["mode"], "unreliable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, candidate, candidate])
+            result = StarBackpackCaptureProbe().run(
+                context,
+                SimpleNamespace(
+                    custom_action_param=_continuous_capture_params(directory)
+                ),
+            )
+            run_dir, session = self._session(directory)
+            partial_was_retained = (run_dir / "capture-01.png").is_file()
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertEqual(session["stop_reason"], "bottom_no_move")
+        self.assertEqual(session["retained_image_count"], 2)
+        self.assertTrue(partial_was_retained)
+        self.assertEqual(len(context.tasker.controller.swipes), 2)
+
+    def test_596px_efficiency_under_target_remains_capture_safe_progress(self):
+        initial = _complex_scene(height=760, width=240, seed=1481)
+        candidate = _shift_up(initial, 596, seed=1482)
+        evaluation = evaluate_feedback_candidate(
+            initial, candidate, _b1d_feedback_config()
+        )
+        self.assertFalse(evaluation["accepted"])
+        self.assertNotEqual(evaluation["motion_reliability"]["mode"], "unreliable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, candidate, candidate])
+            result = StarBackpackCaptureProbe().run(
+                context,
+                SimpleNamespace(
+                    custom_action_param=_continuous_capture_params(directory)
+                ),
+            )
+            _, session = self._session(directory)
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertEqual(session["retained_image_count"], 2)
+        self.assertEqual(len(context.tasker.controller.swipes), 2)
+
+    def test_reliable_terminal_partial_is_retained_before_next_no_move(self):
+        initial = _complex_scene(height=480, width=240, seed=1491)
+        candidate = _shift_up(initial, 200, seed=1492)
+        evaluation = evaluate_feedback_candidate(
+            initial, candidate, _b1d_feedback_config()
+        )
+        self.assertFalse(evaluation["accepted"])
+        self.assertEqual(evaluation["reason"], "terminal_partial_candidate")
+        self.assertNotEqual(evaluation["motion_reliability"]["mode"], "unreliable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, candidate, candidate])
+            result = StarBackpackCaptureProbe().run(
+                context,
+                SimpleNamespace(
+                    custom_action_param=_continuous_capture_params(
+                        directory, height=480
+                    )
+                ),
+            )
+            run_dir, session = self._session(directory)
+            partial_was_retained = (run_dir / "capture-01.png").is_file()
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertEqual(session["stop_reason"], "bottom_no_move")
+        self.assertEqual(session["retained_image_count"], 2)
+        self.assertTrue(partial_was_retained)
+        self.assertEqual(len(context.tasker.controller.swipes), 2)
+
+    def test_reliable_660px_overshoot_remains_rejected(self):
+        initial = _complex_scene(height=900, width=240, seed=1501)
+        candidate = _shift_up(initial, 660, seed=1502)
+        evaluation = evaluate_feedback_candidate(
+            initial, candidate, _b1d_feedback_config()
+        )
+        self.assertFalse(evaluation["accepted"])
+        self.assertGreater(evaluation["actual_shift_px"], 650)
+        self.assertNotEqual(evaluation["motion_reliability"]["mode"], "unreliable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, candidate])
+            result = StarBackpackCaptureProbe().run(
+                context,
+                SimpleNamespace(
+                    custom_action_param=_continuous_capture_params(
+                        directory, height=900
+                    )
+                ),
+            )
+            _, session = self._session(directory)
+
+        self.assertFalse(getattr(result, "success", True))
+        self.assertEqual(session["stop_reason"], "rejected_transition")
+        self.assertEqual(session["failed_transition"], 1)
+        self.assertGreater(session["diagnostics"]["last_actual_shift_px"], 650)
+        self.assertEqual(len(context.tasker.controller.swipes), 1)
+
+    def test_651px_reliable_progress_is_retained_despite_semantic_failsafe_state(self):
+        feedback = _b1d_feedback_config()
+        transition = {
+            "diagnostics": {
+                "motion_reliability": "orb_confidence",
+                "actual_shift_px": 651.0,
+            }
+        }
+        self.assertTrue(is_capture_safe_progress(transition, feedback))
+
+        initial = _complex_scene(height=760, width=240, seed=1511)
+        candidate = _shift_up(initial, 620, seed=1512)
+        b1_results = [
+            _b1_transition_evaluation(
+                "not_applicable_unreliable_motion",
+                False,
+                actual_shift_px=651.0,
+            ),
+            _b1_transition_evaluation("not_applicable_no_move", False),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, candidate, candidate])
+            with mock.patch.object(
+                _MODULE, "evaluate_feedback_candidate", side_effect=b1_results
+            ):
+                result = StarBackpackCaptureProbe().run(
+                    context,
+                    SimpleNamespace(
+                        custom_action_param=_continuous_capture_params(directory)
+                    ),
+                )
+            run_dir, session = self._session(directory)
+            candidate_was_retained = (run_dir / "capture-01.png").is_file()
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertEqual(session["stop_reason"], "bottom_no_move")
+        self.assertEqual(session["retained_images"], ["capture-00.png", "capture-01.png"])
+        self.assertTrue(candidate_was_retained)
+        self.assertEqual(len(context.tasker.controller.swipes), 2)
+
+    def test_652px_reliable_progress_is_not_accepted_by_one_pixel_tolerance(self):
+        feedback = _b1d_feedback_config()
+        transition = {
+            "diagnostics": {
+                "motion_reliability": "orb_confidence",
+                "actual_shift_px": 652.0,
+            }
+        }
+        self.assertFalse(is_capture_safe_progress(transition, feedback))
+
+        initial = _complex_scene(height=760, width=240, seed=1521)
+        candidate = _shift_up(initial, 620, seed=1522)
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, candidate])
+            with mock.patch.object(
+                _MODULE,
+                "evaluate_feedback_candidate",
+                return_value=_b1_transition_evaluation(
+                    "definitely_no_full_row",
+                    False,
+                    actual_shift_px=652.0,
+                ),
+            ):
+                result = StarBackpackCaptureProbe().run(
+                    context,
+                    SimpleNamespace(
+                        custom_action_param=_continuous_capture_params(directory)
+                    ),
+                )
+            run_dir, session = self._session(directory)
+            failed_candidate_exists = (run_dir / "failed-candidate-01.png").is_file()
+
+        self.assertFalse(getattr(result, "success", True))
+        self.assertEqual(session["stop_reason"], "rejected_transition")
+        self.assertEqual(session["retained_images"], ["capture-00.png"])
+        self.assertTrue(failed_candidate_exists)
+        self.assertEqual(len(context.tasker.controller.swipes), 1)
+
+    def test_full_and_ambiguous_semantic_overlap_preserve_both_next_screenshots(self):
+        initial = _complex_scene(height=760, width=240, seed=1421)
+        first = _shift_up(initial, 620, seed=1422)
+        second = _shift_up(first, 620, seed=1423)
+        b1_results = [
+            _b1_transition_evaluation("definitely_full_row", True),
+            _b1_transition_evaluation("ambiguous", True),
+            _b1_transition_evaluation("not_applicable_no_move", False),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, first, second, second])
+            with mock.patch.object(
+                _MODULE, "evaluate_feedback_candidate", side_effect=b1_results
+            ):
+                result = StarBackpackCaptureProbe().run(
+                    context,
+                    SimpleNamespace(
+                        custom_action_param=_continuous_capture_params(directory)
+                    ),
+                )
+            _, session = self._session(directory)
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertEqual(session["retained_image_count"], 3)
+        self.assertEqual(session["stop_reason"], "bottom_no_move")
+        self.assertEqual(len(context.tasker.controller.swipes), 3)
+
+    def test_no_move_before_progress_fails_without_an_extra_swipe(self):
+        initial = _complex_scene(height=760, width=240, seed=1431)
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, initial])
+            result = StarBackpackCaptureProbe().run(
+                context,
+                SimpleNamespace(
+                    custom_action_param=_continuous_capture_params(directory)
+                ),
+            )
+            _, session = self._session(directory)
+
+        self.assertFalse(getattr(result, "success", True))
+        self.assertEqual(session["stop_reason"], "no_move_before_progress")
+        self.assertEqual(session["failed_transition"], 1)
+        self.assertEqual(session["retained_image_count"], 1)
+        self.assertEqual(len(context.tasker.controller.swipes), 1)
+
+    def test_unreliable_transition_stops_as_a_failure(self):
+        initial = _complex_scene(height=760, width=240, seed=1441)
+        candidate = _shift_up(initial, 620, seed=1442)
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, candidate])
+            with mock.patch.object(
+                _MODULE,
+                "evaluate_feedback_candidate",
+                return_value=_b1_transition_evaluation(
+                    "not_applicable_unreliable_motion", False
+                ),
+            ):
+                result = StarBackpackCaptureProbe().run(
+                    context,
+                    SimpleNamespace(
+                        custom_action_param=_continuous_capture_params(directory)
+                    ),
+                )
+            run_dir, session = self._session(directory)
+            failed_candidate_exists = (run_dir / "failed-candidate-01.png").is_file()
+
+        self.assertFalse(getattr(result, "success", True))
+        self.assertEqual(session["stop_reason"], "unreliable_transition")
+        self.assertEqual(session["failed_transition"], 1)
+        self.assertNotIn("failed-candidate-01.png", session["retained_images"])
+        self.assertTrue(failed_candidate_exists)
+        self.assertEqual(len(context.tasker.controller.swipes), 1)
+
+    def test_rejected_transition_stops_as_a_failure(self):
+        initial = _complex_scene(height=760, width=240, seed=1451)
+        candidate = _shift_up(initial, 620, seed=1452)
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, candidate])
+            with mock.patch.object(
+                _MODULE,
+                "evaluate_feedback_candidate",
+                return_value=_b1_transition_evaluation("definitely_full_row", False),
+            ):
+                result = StarBackpackCaptureProbe().run(
+                    context,
+                    SimpleNamespace(
+                        custom_action_param=_continuous_capture_params(directory)
+                    ),
+                )
+            run_dir, session = self._session(directory)
+            failed_candidate_exists = (run_dir / "failed-candidate-01.png").is_file()
+
+        self.assertFalse(getattr(result, "success", True))
+        self.assertEqual(session["stop_reason"], "rejected_transition")
+        self.assertEqual(session["failed_transition"], 1)
+        self.assertNotIn("failed-candidate-01.png", session["retained_images"])
+        self.assertTrue(failed_candidate_exists)
+        self.assertEqual(len(context.tasker.controller.swipes), 1)
+
+    def test_transition_limit_is_a_hard_failure_safety_valve(self):
+        initial = _complex_scene(height=760, width=240, seed=1461)
+        first = _shift_up(initial, 620, seed=1462)
+        second = _shift_up(first, 620, seed=1463)
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, first, second])
+            with mock.patch.object(
+                _MODULE,
+                "evaluate_feedback_candidate",
+                side_effect=[
+                    _b1_transition_evaluation("definitely_no_full_row", True),
+                    _b1_transition_evaluation("ambiguous", True),
+                ],
+            ):
+                result = StarBackpackCaptureProbe().run(
+                    context,
+                    SimpleNamespace(
+                        custom_action_param=_continuous_capture_params(
+                            directory, max_transitions=2
+                        )
+                    ),
+                )
+            _, session = self._session(directory)
+
+        self.assertFalse(getattr(result, "success", True))
+        self.assertEqual(session["stop_reason"], "transition_limit_reached")
+        self.assertEqual(session["failed_transition"], 2)
+        self.assertEqual(session["retained_image_count"], 3)
+        self.assertEqual(len(context.tasker.controller.swipes), 2)
 
 
 if __name__ == "__main__":

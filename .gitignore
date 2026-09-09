@@ -469,3 +469,6 @@ python
 AGENTS.md
 DailyRewards-*.txt
 DailyRewards.txt
+
+# Local Codex task prompts and archived task notes
+prompt/
