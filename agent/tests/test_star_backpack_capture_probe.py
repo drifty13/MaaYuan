@@ -33,6 +33,7 @@ apply_direct_overlap_anchors = _MODULE._apply_direct_overlap_anchors
 find_direct_normal_band_candidate = _MODULE._find_direct_normal_band_candidate
 merge_direct_normal_candidate = _MODULE._merge_direct_normal_candidate
 MotionHypothesis = _MODULE._MotionHypothesis
+MotionEstimate = _MODULE.MotionEstimate
 select_motion_hypothesis = _MODULE._select_motion_hypothesis
 parse_capture_probe_params = _MODULE.parse_capture_probe_params
 StarBackpackCaptureProbe = _MODULE.StarBackpackCaptureProbe
@@ -385,6 +386,54 @@ class StarBackpackCaptureProbeFeedbackTests(unittest.TestCase):
         self.assertTrue(result["ocr_overlap_pair_required"])
         self.assertEqual(result["reason"], "envelope_near_shared_region_boundary")
 
+    def test_semantic_overlap_rejects_rows_that_cross_the_shared_boundary(self):
+        image = np.zeros((760, 240, 3), dtype=np.uint8)
+        boundary_center = 560.0 + 1.06 * (166.5 * 0.34)
+        for clearance in (-9.0, -1.0):
+            with self.subTest(clearance=clearance):
+                result = evaluate_semantic_row_overlap(
+                    image,
+                    image.copy(),
+                    560,
+                    166.5,
+                    prev_row_centers=[boundary_center + clearance],
+                    candidate_row_centers=[boundary_center - 560.0 + clearance],
+                )
+                self.assertEqual(result["semantic_overlap_state"], "definitely_no_full_row")
+                self.assertFalse(result["ocr_overlap_pair_required"])
+
+    def test_semantic_overlap_keeps_nonnegative_boundary_clearance_ambiguous(self):
+        image = np.zeros((760, 240, 3), dtype=np.uint8)
+        boundary_center = 560.0 + 1.06 * (166.5 * 0.34)
+        for clearance in range(0, 10):
+            with self.subTest(clearance=clearance):
+                result = evaluate_semantic_row_overlap(
+                    image,
+                    image.copy(),
+                    560,
+                    166.5,
+                    prev_row_centers=[boundary_center + clearance],
+                    candidate_row_centers=[boundary_center - 560.0 + clearance],
+                )
+                self.assertEqual(result["semantic_overlap_state"], "ambiguous")
+                self.assertTrue(result["ocr_overlap_pair_required"])
+
+    def test_semantic_overlap_marks_safety_margin_and_beyond_as_full(self):
+        image = np.zeros((760, 240, 3), dtype=np.uint8)
+        boundary_center = 560.0 + 1.06 * (166.5 * 0.34)
+        for clearance in (10.0, 30.0):
+            with self.subTest(clearance=clearance):
+                result = evaluate_semantic_row_overlap(
+                    image,
+                    image.copy(),
+                    560,
+                    166.5,
+                    prev_row_centers=[boundary_center + clearance],
+                    candidate_row_centers=[boundary_center - 560.0 + clearance],
+                )
+                self.assertEqual(result["semantic_overlap_state"], "definitely_full_row")
+                self.assertTrue(result["ocr_overlap_pair_required"])
+
     def test_same_physical_overlap_can_have_different_semantic_row_phase(self):
         image = np.zeros((760, 240, 3), dtype=np.uint8)
         complete = evaluate_semantic_row_overlap(
@@ -724,6 +773,130 @@ class StarBackpackCaptureProbeFeedbackTests(unittest.TestCase):
         self.assertEqual(reason["selection_mode"], "normal_motion_full_overlap")
         self.assertEqual(reason["normal_motion_candidate_count"], 1)
         self.assertEqual(reason["selected_by"], "full_overlap_score")
+
+    def test_terminal_confirmed_selection_can_use_strong_short_orb_branch_only_after_bottom(self):
+        strong_terminal = MotionHypothesis(
+            matches=[object()] * 138,
+            shift_y=292.8,
+            median_abs_deviation=0.8,
+            x_coverage=0.85,
+            y_coverage=0.75,
+            mean_descriptor_distance=22.0,
+            anchor_score=0.87,
+            anchor_height_px=467,
+            full_overlap_score=0.95,
+            full_overlap_height_px=467,
+            full_overlap_gray_score=0.95,
+            full_overlap_gradient_score=0.95,
+        )
+        weak_normal_direct_alias = MotionHypothesis(
+            matches=[],
+            shift_y=626.0,
+            median_abs_deviation=0.0,
+            x_coverage=1.0,
+            y_coverage=1.0,
+            mean_descriptor_distance=None,
+            anchor_score=0.68,
+            anchor_height_px=134,
+            full_overlap_score=0.70,
+            full_overlap_height_px=134,
+            full_overlap_gray_score=0.70,
+            full_overlap_gradient_score=0.70,
+            proposal_source="direct_normal_band",
+        )
+        direct_search = {
+            "candidate_injected": True,
+            "best_shift_px": 626.0,
+            "best_score": 0.70,
+        }
+
+        ordinary, ordinary_reason, _ = select_motion_hypothesis(
+            [strong_terminal, weak_normal_direct_alias],
+            (250, 700),
+            (30, 700),
+            direct_search,
+        )
+        terminal, terminal_reason, _ = select_motion_hypothesis(
+            [strong_terminal, weak_normal_direct_alias],
+            (250, 700),
+            (30, 700),
+            direct_search,
+            terminal_confirmed=True,
+            terminal_max_shift_px=300.0,
+        )
+
+        self.assertIs(ordinary, weak_normal_direct_alias)
+        self.assertEqual(ordinary_reason["selection_mode"], "normal_motion_full_overlap")
+        self.assertIs(terminal, strong_terminal)
+        self.assertEqual(
+            terminal_reason["selection_mode"], "terminal_confirmed_short_motion"
+        )
+        self.assertEqual(terminal_reason["proposal_source"], "orb")
+
+    def test_terminal_recheck_requires_a_reanchored_semantic_pair(self):
+        estimate = MotionEstimate(
+            shift_y=292.8,
+            inlier_count=136,
+            match_count=138,
+            confidence=0.96,
+            selected_hypothesis={
+                "proposal_source": "orb",
+                "full_overlap_score": 0.95,
+                "anchor_score": 0.87,
+            },
+        )
+        initial_semantic = {
+            "semantic_overlap_state": "definitely_no_full_row",
+            "ocr_overlap_pair_required": False,
+            "candidate_row_centers": [96.0, 262.5],
+        }
+        reanchored_full = {
+            "semantic_overlap_state": "definitely_full_row",
+            "ocr_overlap_pair_required": True,
+        }
+        reanchored_none = {
+            "semantic_overlap_state": "definitely_no_full_row",
+            "ocr_overlap_pair_required": False,
+        }
+        previous = np.zeros((760, 240, 3), dtype=np.uint8)
+        candidate = np.zeros((760, 240, 3), dtype=np.uint8)
+
+        with mock.patch.object(
+            _MODULE, "estimate_vertical_motion", return_value=estimate
+        ) as motion, mock.patch.object(
+            _MODULE, "_local_overlap_confirmation", return_value=(0.91, 293, True)
+        ), mock.patch.object(
+            _MODULE,
+            "evaluate_semantic_row_overlap",
+            side_effect=[initial_semantic, reanchored_full],
+        ) as semantic:
+            self.assertTrue(
+                _MODULE._terminal_confirmed_overlap_pair_required(
+                    previous, candidate, _b1d_feedback_config()
+                )
+            )
+
+        self.assertTrue(motion.call_args.kwargs["terminal_confirmed"])
+        self.assertEqual(motion.call_args.kwargs["terminal_max_shift_px"], 300.0)
+        self.assertEqual(semantic.call_count, 2)
+        self.assertEqual(
+            semantic.call_args_list[1].kwargs["prev_row_centers"],
+            [388.8, 555.3],
+        )
+        with mock.patch.object(
+            _MODULE, "estimate_vertical_motion", return_value=estimate
+        ), mock.patch.object(
+            _MODULE, "_local_overlap_confirmation", return_value=(0.91, 293, True)
+        ), mock.patch.object(
+            _MODULE,
+            "evaluate_semantic_row_overlap",
+            side_effect=[initial_semantic, reanchored_none],
+        ):
+            self.assertFalse(
+                _MODULE._terminal_confirmed_overlap_pair_required(
+                    previous, candidate, _b1d_feedback_config()
+                )
+            )
 
     def test_direct_normal_candidate_wins_with_zero_orb_feature_support(self):
         low_alias = MotionHypothesis(
@@ -1384,6 +1557,7 @@ class StarBackpackContinuousCaptureTests(unittest.TestCase):
             "capture-00.png", "capture-01.png", "capture-02.png",
         ])
         self.assertEqual(session["retained_image_count"], 3)
+        self.assertEqual(session["adjacent_relations"], [])
         self.assertIsNone(session["failed_transition"])
         self.assertEqual(len(context.tasker.controller.swipes), 3)
         self.assertTrue(has_last_retained_image)
@@ -1414,6 +1588,7 @@ class StarBackpackContinuousCaptureTests(unittest.TestCase):
 
         self.assertTrue(getattr(result, "success", False))
         self.assertEqual(session["retained_image_count"], 2)
+        self.assertEqual(session["adjacent_relations"], [])
         self.assertEqual(len(context.tasker.controller.swipes), 2)
 
     def test_593px_reliable_under_target_is_retained_until_bottom(self):
@@ -1627,8 +1802,198 @@ class StarBackpackContinuousCaptureTests(unittest.TestCase):
 
         self.assertTrue(getattr(result, "success", False))
         self.assertEqual(session["retained_image_count"], 3)
+        self.assertEqual(
+            session["adjacent_relations"],
+            [
+                {
+                    "previous_image": "capture-00.png",
+                    "current_image": "capture-01.png",
+                    "relation": "overlap",
+                },
+                {
+                    "previous_image": "capture-01.png",
+                    "current_image": "capture-02.png",
+                    "relation": "overlap",
+                },
+            ],
+        )
         self.assertEqual(session["stop_reason"], "bottom_no_move")
         self.assertEqual(len(context.tasker.controller.swipes), 3)
+
+    def test_ambiguous_safe_progress_retains_required_overlap_when_b1_is_not_accepted(self):
+        initial = _complex_scene(height=760, width=240, seed=1424)
+        candidate = _shift_up(initial, 620, seed=1425)
+        b1_results = [
+            _b1_transition_evaluation(
+                "ambiguous", False, actual_shift_px=620.0
+            ),
+            _b1_transition_evaluation("not_applicable_no_move", False),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, candidate, candidate])
+            with mock.patch.object(
+                _MODULE, "evaluate_feedback_candidate", side_effect=b1_results
+            ):
+                result = StarBackpackCaptureProbe().run(
+                    context,
+                    SimpleNamespace(
+                        custom_action_param=_continuous_capture_params(directory)
+                    ),
+                )
+            _, session = self._session(directory)
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertFalse(b1_results[0]["accepted"])
+        self.assertEqual(session["retained_images"], ["capture-00.png", "capture-01.png"])
+        self.assertEqual(
+            session["adjacent_relations"],
+            [
+                {
+                    "previous_image": "capture-00.png",
+                    "current_image": "capture-01.png",
+                    "relation": "overlap",
+                }
+            ],
+        )
+
+    def test_only_the_final_required_pair_is_handed_off_across_six_retained_images(self):
+        initial = _complex_scene(height=760, width=240, seed=1426)
+        images = [initial]
+        for index in range(1, 6):
+            images.append(_shift_up(images[-1], 620, seed=1426 + index))
+        b1_results = [
+            _b1_transition_evaluation("definitely_no_full_row", True),
+            _b1_transition_evaluation("definitely_no_full_row", True),
+            _b1_transition_evaluation("definitely_no_full_row", True),
+            _b1_transition_evaluation("definitely_no_full_row", True),
+            _b1_transition_evaluation(
+                "ambiguous", False, actual_shift_px=620.0
+            ),
+            _b1_transition_evaluation("not_applicable_no_move", False),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([*images, images[-1]])
+            with mock.patch.object(
+                _MODULE, "evaluate_feedback_candidate", side_effect=b1_results
+            ):
+                result = StarBackpackCaptureProbe().run(
+                    context,
+                    SimpleNamespace(
+                        custom_action_param=_continuous_capture_params(
+                            directory, max_transitions=6
+                        )
+                    ),
+                )
+            _, session = self._session(directory)
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertEqual(session["stop_reason"], "bottom_no_move")
+        self.assertEqual(session["retained_image_count"], 6)
+        self.assertEqual(
+            session["adjacent_relations"],
+            [
+                {
+                    "previous_image": "capture-04.png",
+                    "current_image": "capture-05.png",
+                    "relation": "overlap",
+                }
+            ],
+        )
+        self.assertEqual(len(context.tasker.controller.swipes), 6)
+
+    def test_bottom_confirmation_reconciles_a_missing_final_overlap_relation(self):
+        initial = _complex_scene(height=760, width=240, seed=1430)
+        candidate = _shift_up(initial, 620, seed=1431)
+        b1_results = [
+            _b1_transition_evaluation("definitely_no_full_row", True),
+            _b1_transition_evaluation("not_applicable_no_move", False),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, candidate, candidate])
+            with mock.patch.object(
+                _MODULE, "evaluate_feedback_candidate", side_effect=b1_results
+            ), mock.patch.object(
+                _MODULE,
+                "_terminal_confirmed_overlap_pair_required",
+                return_value=True,
+            ) as reconcile:
+                result = StarBackpackCaptureProbe().run(
+                    context,
+                    SimpleNamespace(
+                        custom_action_param=_continuous_capture_params(directory)
+                    ),
+                )
+            _, session = self._session(directory)
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertEqual(session["stop_reason"], "bottom_no_move")
+        self.assertEqual(
+            session["adjacent_relations"],
+            [
+                {
+                    "previous_image": "capture-00.png",
+                    "current_image": "capture-01.png",
+                    "relation": "overlap",
+                }
+            ],
+        )
+        reconcile.assert_called_once()
+
+    def test_bottom_confirmation_does_not_add_final_relation_without_semantic_pair(self):
+        initial = _complex_scene(height=760, width=240, seed=1432)
+        candidate = _shift_up(initial, 620, seed=1433)
+        b1_results = [
+            _b1_transition_evaluation("definitely_no_full_row", True),
+            _b1_transition_evaluation("not_applicable_no_move", False),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, candidate, candidate])
+            with mock.patch.object(
+                _MODULE, "evaluate_feedback_candidate", side_effect=b1_results
+            ), mock.patch.object(
+                _MODULE,
+                "_terminal_confirmed_overlap_pair_required",
+                return_value=False,
+            ) as reconcile:
+                result = StarBackpackCaptureProbe().run(
+                    context,
+                    SimpleNamespace(
+                        custom_action_param=_continuous_capture_params(directory)
+                    ),
+                )
+            _, session = self._session(directory)
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertEqual(session["adjacent_relations"], [])
+        reconcile.assert_called_once()
+
+    def test_bottom_confirmation_does_not_duplicate_an_existing_final_relation(self):
+        initial = _complex_scene(height=760, width=240, seed=1434)
+        candidate = _shift_up(initial, 620, seed=1435)
+        b1_results = [
+            _b1_transition_evaluation("definitely_full_row", True),
+            _b1_transition_evaluation("not_applicable_no_move", False),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            context = _FakeCaptureContext([initial, candidate, candidate])
+            with mock.patch.object(
+                _MODULE, "evaluate_feedback_candidate", side_effect=b1_results
+            ), mock.patch.object(
+                _MODULE,
+                "_terminal_confirmed_overlap_pair_required",
+                return_value=True,
+            ) as reconcile:
+                result = StarBackpackCaptureProbe().run(
+                    context,
+                    SimpleNamespace(
+                        custom_action_param=_continuous_capture_params(directory)
+                    ),
+                )
+            _, session = self._session(directory)
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertEqual(len(session["adjacent_relations"]), 1)
+        reconcile.assert_not_called()
 
     def test_no_move_before_progress_fails_without_an_extra_swipe(self):
         initial = _complex_scene(height=760, width=240, seed=1431)
@@ -1672,6 +2037,7 @@ class StarBackpackContinuousCaptureTests(unittest.TestCase):
         self.assertFalse(getattr(result, "success", True))
         self.assertEqual(session["stop_reason"], "unreliable_transition")
         self.assertEqual(session["failed_transition"], 1)
+        self.assertEqual(session["adjacent_relations"], [])
         self.assertNotIn("failed-candidate-01.png", session["retained_images"])
         self.assertTrue(failed_candidate_exists)
         self.assertEqual(len(context.tasker.controller.swipes), 1)
@@ -1698,6 +2064,7 @@ class StarBackpackContinuousCaptureTests(unittest.TestCase):
         self.assertFalse(getattr(result, "success", True))
         self.assertEqual(session["stop_reason"], "rejected_transition")
         self.assertEqual(session["failed_transition"], 1)
+        self.assertEqual(session["adjacent_relations"], [])
         self.assertNotIn("failed-candidate-01.png", session["retained_images"])
         self.assertTrue(failed_candidate_exists)
         self.assertEqual(len(context.tasker.controller.swipes), 1)
