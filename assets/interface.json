@@ -54,7 +54,8 @@
       "name": "开发调试｜星石背包连续采集",
       "entry": "开发调试-星石背包连续采集",
       "default_check": false,
-      "description": "请先进入「星石背包 → 主星 → 顶部」。本任务每轮只向上滑动一次并复用 B1 判定；检测到底后停止并保存连续截图，不会 OCR 或上传数据。"
+      "option": ["同步星石至YuanHub"],
+      "description": "请先进入「星石背包 → 主星 → 顶部」。本任务每轮只向上滑动一次并复用 B1 判定；检测到底后停止并保存连续截图。默认仅保存到本地；开启「同步星石至YuanHub」后，仅在成功到达底部的主星采集上执行开发阶段 transport smoke，不在 MaaYuan 内执行 OCR。"
     },
     {
       "name": "🚀 启动biubiu加速器",
@@ -835,6 +836,34 @@
         {
           "name": "No",
           "option": ["保存到指定文件"],
+          "pipeline_override": {
+            "在线上传认证": {
+              "attach": {
+                "mode": "仅保存到本地"
+              }
+            }
+          }
+        },
+        {
+          "name": "Yes",
+          "option": ["YuanHub连接码"],
+          "pipeline_override": {
+            "在线上传认证": {
+              "attach": {
+                "mode": "自动上报"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "同步星石至YuanHub": {
+      "type": "switch",
+      "default_case": "No",
+      "description": "将星石背包采集结果同步至 YuanHub，供 YuanStar 后续导入与识别使用。启用后需填写对应子账号的 YuanHub 连接码。",
+      "cases": [
+        {
+          "name": "No",
           "pipeline_override": {
             "在线上传认证": {
               "attach": {
