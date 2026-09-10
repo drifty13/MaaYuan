@@ -15,6 +15,7 @@ from maa.agent.agent_server import AgentServer
 from maa.context import Context
 from maa.custom_action import CustomAction
 
+from custom.action.star_capture_transport import upload_successful_main_capture
 from utils import logger
 
 
@@ -277,6 +278,14 @@ def parse_capture_probe_params(raw: Any) -> dict[str, Any]:
             raise ValueError("max_transitions 不能超过 50")
         parsed["max_transitions"] = max_transitions
         parsed["feedback"] = _parse_diagnostic_feedback(params.get("feedback"))
+        parsed["allow_main_only_transport_smoke"] = _parse_bool(
+            params.get("allow_main_only_transport_smoke"),
+            "allow_main_only_transport_smoke",
+        )
+        game_version = params.get("game_version", "如鸢")
+        if game_version not in {"如鸢", "代号鸢"}:
+            raise ValueError("game_version 必须是 如鸢 或 代号鸢")
+        parsed["game_version"] = game_version
     return parsed
 
 
@@ -2048,6 +2057,19 @@ class StarBackpackCaptureProbe(CustomAction):
                 return CustomAction.RunResult(success=True)
 
             session = self._run_continuous_capture(context, params, run_dir, before)
+            if session["success"] and params["allow_main_only_transport_smoke"]:
+                try:
+                    upload_result = upload_successful_main_capture(
+                        context, run_dir, session, params["game_version"]
+                    )
+                    if upload_result is None:
+                        logger.info("星石背包采集已完成；当前为仅保存到本地模式，未上传。")
+                    elif upload_result.success:
+                        logger.info("星石背包主星 smoke 上传成功。")
+                    else:
+                        logger.warning(f"星石背包主星 smoke 上传失败：{upload_result.message}")
+                except Exception as exc:
+                    logger.warning(f"星石背包主星 smoke 上传失败：{exc}")
             logger.info(
                 "星石背包连续采集完成: "
                 f"success={session['success']}, stop={session['stop_reason']}, "

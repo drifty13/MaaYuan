@@ -6,6 +6,8 @@
         "custom_action": "StarBackpackCaptureProbe",
         "custom_action_param": {
           "mode": "continuous_capture",
+          "allow_main_only_transport_smoke": true,
+          "game_version": "如鸢",
           "debug_dir": "debug/star-backpack-continuous-capture",
           "compare_roi": [40, 280, 640, 760],
           "swipe": {
