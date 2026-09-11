@@ -52,6 +52,30 @@ class _Response:
 
 
 class StarCaptureTransportTests(unittest.TestCase):
+    def test_full_batch_maps_local_section_names_to_unique_wire_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            batch = {
+                "schemaVersion": 1, "captureId": "capture-full", "source": "maayuan", "gameVersion": "如鸢",
+                "sections": {
+                    "main": {"images": [{"sourceImageId": "capture-full:main:000", "sourceOrder": 1, "fileName": "main/capture-00.png"}, {"sourceImageId": "capture-full:main:001", "sourceOrder": 2, "fileName": "main/capture-01.png"}], "adjacentRelations": [{"previousSourceImageId": "capture-full:main:000", "currentSourceImageId": "capture-full:main:001", "relation": "overlap"}], "complete": True, "stopReason": "bottom_no_move"},
+                    "support": {"images": [{"sourceImageId": "capture-full:support:000", "sourceOrder": 3, "fileName": "support/capture-00.png"}], "adjacentRelations": [], "complete": True, "stopReason": "bottom_no_move"},
+                    "experience": {"images": [{"sourceImageId": "capture-full:experience:000", "sourceOrder": 4, "fileName": "experience/capture-00.png"}], "adjacentRelations": [], "complete": True, "stopReason": "single_capture"},
+                },
+            }
+            for section in ("main", "support", "experience"):
+                path = run_dir / section / "capture-00.png"
+                path.parent.mkdir()
+                path.write_bytes(PNG)
+            (run_dir / "main" / "capture-01.png").write_bytes(PNG)
+            manifest, wire_images = transport.build_full_capture_manifest(run_dir, batch)
+            body, _boundary = transport._multipart_body(manifest, wire_images)
+        self.assertEqual(list(manifest["sections"]), ["main", "support", "experience"])
+        self.assertEqual([image["source_order"] for section in manifest["sections"].values() for image in section["images"]], [1, 2, 3, 4])
+        self.assertEqual([name for name, _path in wire_images], ["main-000.png", "main-001.png", "support-000.png", "experience-000.png"])
+        self.assertIn(b'filename="support-000.png"', body)
+        self.assertNotIn(b'filename="capture-00.png"', body)
+
     def test_manifest_uses_stable_capture_id_one_based_order_and_preserved_overlap(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory)

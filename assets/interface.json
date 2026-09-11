@@ -58,6 +58,13 @@
       "description": "请先进入「星石背包 → 主星 → 顶部」。本任务每轮只向上滑动一次并复用 B1 判定；检测到底后停止并保存连续截图。默认仅保存到本地；开启「同步星石至YuanHub」后，仅在成功到达底部的主星采集上执行开发阶段 transport smoke，不在 MaaYuan 内执行 OCR。"
     },
     {
+      "name": "开发调试｜星石背包正式三段采集",
+      "entry": "星石背包-正式三段采集",
+      "default_check": false,
+      "option": ["同步星石至YuanHub"],
+      "description": "请先进入「星石背包 → 主星 → 顶部」。依次采集主星、自动切换辅星并连续采集、自动切换经验星曜并只截图一次；默认仅本地组装 CaptureBatchV1，开启同步后仅上传完整三段采集，YuanStar 仍停在“开始识别”前。"
+    },
+    {
       "name": "🚀 启动biubiu加速器",
       "entry": "启动biubiu加速",
       "default_check": false,

@@ -36,13 +36,16 @@ function Copy-ProbeFile {
     Write-Host "已同步: $SourceRelativePath -> $RuntimeRelativePath"
 }
 
-# 只同步 B1 probe 与 B2 连续采集所需文件（含单次滑动校准、真实位移 selector、direct normal proposer、行 envelope 语义 overlap 与连续截图编排）；不触碰 config、日志、MaaYuan.exe、MFAAvalonia 或 Python runtime。
+# 只同步 B1/B5/B6 星石背包采集与完整批次上传所需文件；不触碰 config、日志、MaaYuan.exe、MFAAvalonia 或 Python runtime。
 Copy-ProbeFile -SourceRelativePath 'agent/custom/action/star_backpack_capture_probe.py' -RuntimeRelativePath 'agent/custom/action/star_backpack_capture_probe.py'
+Copy-ProbeFile -SourceRelativePath 'agent/custom/action/star_backpack_capture_orchestration.py' -RuntimeRelativePath 'agent/custom/action/star_backpack_capture_orchestration.py'
+Copy-ProbeFile -SourceRelativePath 'agent/custom/action/star_capture_transport.py' -RuntimeRelativePath 'agent/custom/action/star_capture_transport.py'
 Copy-ProbeFile -SourceRelativePath 'agent/custom/action/__init__.py' -RuntimeRelativePath 'agent/custom/action/__init__.py'
 Copy-ProbeFile -SourceRelativePath 'assets/resource/base/pipeline/star_backpack_capture_probe.json' -RuntimeRelativePath 'resource/base/pipeline/star_backpack_capture_probe.json'
 Copy-ProbeFile -SourceRelativePath 'assets/resource/base/pipeline/star_backpack_scroll_pair_probe.json' -RuntimeRelativePath 'resource/base/pipeline/star_backpack_scroll_pair_probe.json'
 Copy-ProbeFile -SourceRelativePath 'assets/resource/base/pipeline/star_backpack_feedback_probe.json' -RuntimeRelativePath 'resource/base/pipeline/star_backpack_feedback_probe.json'
 Copy-ProbeFile -SourceRelativePath 'assets/resource/base/pipeline/star_backpack_continuous_capture.json' -RuntimeRelativePath 'resource/base/pipeline/star_backpack_continuous_capture.json'
+Copy-ProbeFile -SourceRelativePath 'assets/resource/base/pipeline/star_backpack_capture_orchestration.json' -RuntimeRelativePath 'resource/base/pipeline/star_backpack_capture_orchestration.json'
 
 $sourceInterfacePath = Join-Path $sourceRoot 'assets/interface.json'
 $runtimeInterfacePath = Join-Path $runtimeRoot 'interface.json'
@@ -60,7 +63,8 @@ $probeNames = @(
     '开发调试｜星石背包截图探针',
     '开发调试｜星石背包单次滑动探针',
     '开发调试｜星石背包反馈滑动探针',
-    '开发调试｜星石背包连续采集'
+    '开发调试｜星石背包连续采集',
+    '开发调试｜星石背包正式三段采集'
 )
 $sourceTasksByName = @{}
 foreach ($probeName in $probeNames) {
@@ -71,7 +75,7 @@ foreach ($probeName in $probeNames) {
     $sourceTasksByName[$probeName] = $sourceTask[0]
 }
 
-# 仅增补或替换四个星石背包任务，保留 runtime 的 version、agent、controller、资源和所有其他任务。
+# 仅增补或替换五个星石背包任务，保留 runtime 的 version、agent、controller、资源和所有其他任务。
 $patchedTasks = New-Object System.Collections.Generic.List[object]
 $patchedNames = New-Object System.Collections.Generic.HashSet[string]
 $probeNames | ForEach-Object {
